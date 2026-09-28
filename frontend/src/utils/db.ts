@@ -8,7 +8,7 @@ import type { Session } from '@/types/session'
 /** IndexedDB 数据库名 */
 export const DB_NAME = 'gbcuesheet'
 /** 当前数据结构版本号，与 db.version() 对应 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 单键值元数据表，记录结构版本等本地状态 */
 export interface AppMetaRecord {
@@ -22,6 +22,7 @@ export interface AppMetaRecord {
  * - v1：场次 / 灯位通道 / Cue / 通道电平 / 排演表 五张表
  * - v2：场次补充 updatedAt 索引、排演表补充 sheetNo 索引与条目快照、新增 appMeta 元数据表，
  *       并对既有数据执行升级迁移（补齐字段、规范化遗留编号）
+ * - v3：排演表补充 removedCueNos（另存时已删除编号）与 refreshedFromSheetNo（另存来源）
  */
 export class CueSheetDatabase extends Dexie {
   sessions!: Table<Session, string>
@@ -74,6 +75,25 @@ export class CueSheetDatabase extends Dexie {
             if (!sheet.sheetNo) sheet.sheetNo = 'RS-LEGACY'
             if (!Array.isArray(sheet.cueLines)) sheet.cueLines = []
             if (!Array.isArray(sheet.includedCueIds)) sheet.includedCueIds = []
+          })
+      })
+
+    this.version(3)
+      .stores({
+        sessions: 'id, order, createdAt, updatedAt',
+        fixtures: 'id, sessionId, channel, [sessionId+channel]',
+        cues: 'id, sessionId, cueNo, orderIndex, [sessionId+orderIndex]',
+        levels: 'id, cueId, fixtureId, [cueId+fixtureId]',
+        sheets: 'id, sessionId, sheetNo, generatedAt',
+        appMeta: 'key'
+      })
+      .upgrade(async (transaction) => {
+        await transaction
+          .table('sheets')
+          .toCollection()
+          .modify((sheet: RehearsalSheet) => {
+            if (!Array.isArray(sheet.removedCueNos)) sheet.removedCueNos = []
+            if (sheet.refreshedFromSheetNo === undefined) sheet.refreshedFromSheetNo = null
           })
       })
   }

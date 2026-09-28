@@ -176,8 +176,14 @@ export function buildSheetText(sheet: RehearsalSheet, session?: Session): string
   }
   lines.push(`生成时间：${formatDateTime(sheet.generatedAt)}`)
   lines.push(`Cue 数量：${sheet.cueLines.length}`)
+  if (sheet.refreshedFromSheetNo) lines.push(`另存来源：${sheet.refreshedFromSheetNo}（原表内容保持不变）`)
   if (sheet.note) lines.push(`制表备注：${sheet.note}`)
   lines.push('')
+
+  if (sheet.removedCueNos.length > 0) {
+    lines.push(`原表中已不再存在的 Cue（${sheet.removedCueNos.length} 条）：${sheet.removedCueNos.join('、')}`)
+    lines.push('')
+  }
 
   if (sheet.cueLines.length === 0) {
     lines.push('（本表未包含任何 Cue）')

@@ -19,6 +19,7 @@ function buildSheetNo(sequence: number, generatedAt: Date): string {
 
 /**
  * 排演表仓库：勾选 Cue 生成条目快照并本地留存历史。
+ * 快照生成后不再随 Cue 修改而变化；新旧差异由 utils/sheetDiff 即时比对得出。
  */
 export const useSheetStore = defineStore('sheet', () => {
   const sheets = ref<RehearsalSheet[]>([])
@@ -51,17 +52,17 @@ export const useSheetStore = defineStore('sheet', () => {
     hydrated.value = true
   }
 
-  /** 依据勾选的 Cue 组装条目快照并落库 */
-  async function createSheet(draft: SheetDraft): Promise<RehearsalSheet | null> {
+  /** 按当前 Cue / 通道电平数据组装一组 Cue 的条目快照 */
+  function buildCueLines(sessionId: string, cues: { id: string }[]): SheetCueLine[] {
     const cueStore = useCueStore()
     const levelStore = useLevelStore()
     const fixtureStore = useFixtureStore()
 
-    const ordered = cueStore.sortedCuesOfSession(draft.sessionId).filter((cue) => draft.cueIds.includes(cue.id))
-    if (ordered.length === 0) return null
+    const wantedIds = new Set(cues.map((cue) => cue.id))
+    const ordered = cueStore.sortedCuesOfSession(sessionId).filter((cue) => wantedIds.has(cue.id))
 
-    const cueLines: SheetCueLine[] = ordered.map((cue) => {
-      const channels: SheetChannelLine[] = sortFixturesByChannel(fixtureStore.fixturesOfSession(draft.sessionId))
+    return ordered.map((cue) => {
+      const channels: SheetChannelLine[] = sortFixturesByChannel(fixtureStore.fixturesOfSession(sessionId))
         .map((fixture) => {
           const level = levelStore.levelOf(cue.id, fixture.id)
           if (!level) return null
@@ -89,20 +90,79 @@ export const useSheetStore = defineStore('sheet', () => {
         channels
       }
     })
+  }
 
+  /** 落库一张新排演表（不修改任何既有表） */
+  async function persistSheet(input: {
+    sessionId: string
+    note: string
+    cueLines: SheetCueLine[]
+    removedCueNos: string[]
+    refreshedFromSheetNo: string | null
+  }): Promise<RehearsalSheet> {
     const generatedAt = new Date()
     const created: RehearsalSheet = {
       id: createId('sheet'),
-      sessionId: draft.sessionId,
+      sessionId: input.sessionId,
       sheetNo: buildSheetNo(nextSequence(generatedAt), generatedAt),
       generatedAt: generatedAt.toISOString(),
-      includedCueIds: cueLines.map((line) => line.cueId),
-      note: draft.note,
-      cueLines
+      includedCueIds: input.cueLines.map((line) => line.cueId),
+      note: input.note,
+      cueLines: input.cueLines,
+      removedCueNos: input.removedCueNos,
+      refreshedFromSheetNo: input.refreshedFromSheetNo
     }
     await db.sheets.put(created)
     sheets.value = [...sheets.value, created]
     return created
+  }
+
+  /** 依据勾选的 Cue 组装条目快照并落库 */
+  async function createSheet(draft: SheetDraft): Promise<RehearsalSheet | null> {
+    const cueStore = useCueStore()
+    const wanted = cueStore
+      .sortedCuesOfSession(draft.sessionId)
+      .filter((cue) => draft.cueIds.includes(cue.id))
+    if (wanted.length === 0) return null
+
+    const cueLines = buildCueLines(
+      draft.sessionId,
+      wanted.map((cue) => ({ id: cue.id }))
+    )
+    if (cueLines.length === 0) return null
+
+    return persistSheet({
+      sessionId: draft.sessionId,
+      note: draft.note,
+      cueLines,
+      removedCueNos: [],
+      refreshedFromSheetNo: null
+    })
+  }
+
+  /**
+   * 按最新内容另存：原表保持生成时内容不变，新表只收录原表里仍在的 Cue，
+   * 已不再存在的编号单独列入 removedCueNos。
+   * 返回 null 表示原表 Cue 已全部不存在，无法另存。
+   */
+  async function refreshSheet(sourceId: string, note?: string): Promise<RehearsalSheet | null> {
+    const source = sheetById(sourceId)
+    if (!source) return null
+    const cueStore = useCueStore()
+    const currentCueIds = new Set(cueStore.cuesOfSession(source.sessionId).map((cue) => cue.id))
+
+    const removedCueNos = source.cueLines.filter((line) => !currentCueIds.has(line.cueId)).map((line) => line.cueNo)
+    const survivorIds = source.cueLines.filter((line) => currentCueIds.has(line.cueId)).map((line) => line.cueId)
+    if (survivorIds.length === 0) return null
+
+    const cueLines = buildCueLines(source.sessionId, survivorIds.map((id) => ({ id })))
+    return persistSheet({
+      sessionId: source.sessionId,
+      note: note ?? `由 ${source.sheetNo} 按最新内容另存`,
+      cueLines,
+      removedCueNos,
+      refreshedFromSheetNo: source.sheetNo
+    })
   }
 
   async function removeSheet(id: string): Promise<void> {
@@ -127,6 +187,7 @@ export const useSheetStore = defineStore('sheet', () => {
     sheetById,
     hydrate,
     createSheet,
+    refreshSheet,
     removeSheet,
     removeBySession
   }

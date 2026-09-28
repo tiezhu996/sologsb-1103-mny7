@@ -7,6 +7,7 @@ import {
   NCheckbox,
   NInput,
   NModal,
+  NPopover,
   NSelect,
   NSwitch,
   NTag,
@@ -15,17 +16,22 @@ import {
 } from 'naive-ui'
 import BlankHint from '@/components/common/BlankHint.vue'
 import { useCueStore } from '@/stores/cueStore'
+import { useFixtureStore } from '@/stores/fixtureStore'
+import { useLevelStore } from '@/stores/levelStore'
 import { useSessionStore } from '@/stores/sessionStore'
 import { useSheetStore } from '@/stores/sheetStore'
-import type { RehearsalSheet } from '@/types/sheet'
+import type { RehearsalSheet, SheetDiff } from '@/types/sheet'
 import { buildSheetText, cueTotalSeconds, formatDateTime, formatSeconds } from '@/utils/fade'
 import { buildSheetFilename, copyText, downloadTextFile } from '@/utils/export'
+import { diffSheet, formatChangeKinds } from '@/utils/sheetDiff'
 
 const router = useRouter()
 const message = useMessage()
 const dialog = useDialog()
 const sessionStore = useSessionStore()
 const cueStore = useCueStore()
+const fixtureStore = useFixtureStore()
+const levelStore = useLevelStore()
 const sheetStore = useSheetStore()
 
 const showAllSessions = ref(false)
@@ -44,6 +50,45 @@ const selectedCount = computed(() => cues.value.filter((cue) => cueStore.isSelec
 const sheets = computed(() =>
   showAllSessions.value ? sheetStore.sheetsSorted : sheetStore.sheetsOfSession(selectedSessionId.value)
 )
+
+/**
+ * 每张历史排演表相对当前 Cue / 电平数据的落后情况。
+ * store 中的 cues / levels / fixtures 变化时自动重算。
+ */
+const diffMap = computed<Record<string, SheetDiff>>(() => {
+  const result: Record<string, SheetDiff> = {}
+  sheetStore.sheetsSorted.forEach((sheet) => {
+    result[sheet.id] = diffSheet(
+      sheet,
+      cueStore.cuesOfSession(sheet.sessionId),
+      levelStore.levels,
+      fixtureStore.fixturesOfSession(sheet.sessionId)
+    )
+  })
+  return result
+})
+
+function diffOf(sheet: RehearsalSheet): SheetDiff {
+  return diffMap.value[sheet.id] ?? {
+    status: 'up-to-date',
+    changedCount: 0,
+    changedCueNos: [],
+    changedCueIds: [],
+    detail: [],
+    missingCueNos: []
+  }
+}
+
+/** 场次已删除时无法读取当前 Cue，也就无法比对与另存 */
+function isSessionAlive(sheet: RehearsalSheet): boolean {
+  return sessionStore.sessionById(sheet.sessionId) !== null
+}
+
+/** 原表中仍存在、可收录进新表的 Cue 数 */
+function survivorCount(sheet: RehearsalSheet): number {
+  const currentIds = new Set(cueStore.cuesOfSession(sheet.sessionId).map((cue) => cue.id))
+  return sheet.cueLines.filter((line) => currentIds.has(line.cueId)).length
+}
 
 const previewText = computed(() => {
   if (!previewSheet.value) return ''
@@ -132,6 +177,20 @@ function confirmRemove(sheet: RehearsalSheet): void {
       message.success('排演表已删除')
     }
   })
+}
+
+/** 按最新内容另存：原表不动，另建一张只收录仍在 Cue 的新表 */
+async function refreshLatest(sheet: RehearsalSheet): Promise<void> {
+  const created = await sheetStore.refreshSheet(sheet.id)
+  if (!created) {
+    message.warning('原表中的 Cue 已全部不存在，无法另存')
+    return
+  }
+  const removedCount = created.removedCueNos.length
+  message.success(
+    `已另存为 ${created.sheetNo}，收录 ${created.cueLines.length} 条 Cue` +
+      (removedCount > 0 ? `，另有 ${removedCount} 条原编号已不存在` : '')
+  )
 }
 
 function goCues(): void {
@@ -250,8 +309,70 @@ function goSessions(): void {
               <span v-if="sheet.note">备注：{{ sheet.note }}</span>
             </div>
 
+            <div v-if="sheet.refreshedFromSheetNo" class="sheet-card__refresh">
+              由 {{ sheet.refreshedFromSheetNo }} 按最新内容另存
+              <template v-if="sheet.removedCueNos.length > 0">
+                ｜原表中已不再存在 {{ sheet.removedCueNos.length }} 条：
+                <span class="sheet-card__missing-nos mono">{{ sheet.removedCueNos.join('、') }}</span>
+              </template>
+            </div>
+
+            <div v-if="isSessionAlive(sheet)" class="sheet-card__diff">
+              <template v-if="diffOf(sheet).status === 'up-to-date'">
+                <NTag size="small" type="success" :bordered="false">与最新内容一致</NTag>
+              </template>
+              <template v-else>
+                <NPopover trigger="click" placement="bottom" :show-arrow="false">
+                  <template #trigger>
+                    <NTag size="small" type="warning" :bordered="false" class="sheet-card__diff-tag">
+                      有 {{ diffOf(sheet).changedCount }} 条变化
+                    </NTag>
+                  </template>
+                  <ul class="diff-pop">
+                    <li v-for="item in diffOf(sheet).detail" :key="item.cueId" class="diff-pop__item">
+                      <span class="mono diff-pop__no">
+                        {{ item.snapshotCueNo }}<template v-if="item.cueNo !== item.snapshotCueNo"> → {{ item.cueNo }}</template>
+                      </span>
+                      <span class="diff-pop__kinds">{{ formatChangeKinds(item.kinds) }}</span>
+                    </li>
+                    <li v-if="diffOf(sheet).detail.length === 0" class="diff-pop__empty">无参数变化</li>
+                  </ul>
+                </NPopover>
+                <NTag
+                  v-if="diffOf(sheet).missingCueNos.length > 0"
+                  size="small"
+                  type="error"
+                  :bordered="false"
+                  :title="diffOf(sheet).missingCueNos.join('、')"
+                >
+                  {{ diffOf(sheet).missingCueNos.length }} 条已不存在
+                </NTag>
+                <span class="sheet-card__diff-nos mono">
+                  <template v-if="diffOf(sheet).changedCueNos.length > 0">
+                    变化：{{ diffOf(sheet).changedCueNos.join('、') }}
+                  </template>
+                  <template v-if="diffOf(sheet).missingCueNos.length > 0">
+                    <template v-if="diffOf(sheet).changedCueNos.length > 0">；</template>
+                    已不存在：{{ diffOf(sheet).missingCueNos.join('、') }}
+                  </template>
+                </span>
+              </template>
+            </div>
+            <div v-else class="sheet-card__diff">
+              <NTag size="small" type="default" :bordered="false">场次已删除，无法比对</NTag>
+            </div>
+
             <div class="sheet-card__actions">
               <NButton size="tiny" @click="previewSheet = sheet">预览</NButton>
+              <NButton
+                v-if="isSessionAlive(sheet) && diffOf(sheet).status === 'stale'"
+                size="tiny"
+                type="primary"
+                :disabled="survivorCount(sheet) === 0"
+                @click="refreshLatest(sheet)"
+              >
+                按最新内容另存
+              </NButton>
               <NButton size="tiny" quaternary @click="handleCopy(sheet)">复制文本</NButton>
               <NButton size="tiny" quaternary @click="handleDownload(sheet)">下载 .txt</NButton>
               <NButton size="tiny" quaternary type="error" @click="confirmRemove(sheet)">删除</NButton>
@@ -424,6 +545,67 @@ function goSessions(): void {
   flex-wrap: wrap;
   padding-top: 8px;
   border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.sheet-card__refresh {
+  font-size: 12px;
+  color: rgba(78, 161, 242, 0.85);
+  line-height: 1.6;
+}
+
+.sheet-card__missing-nos {
+  color: rgba(255, 255, 255, 0.65);
+}
+
+.sheet-card__diff {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.sheet-card__diff-tag {
+  cursor: pointer;
+}
+
+.sheet-card__diff-nos {
+  font-size: 11px;
+  line-height: 1.6;
+  color: rgba(255, 255, 255, 0.5);
+  word-break: break-all;
+}
+
+.diff-pop {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  min-width: 220px;
+  max-width: 320px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.diff-pop__item {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+}
+
+.diff-pop__no {
+  color: #f2b544;
+  white-space: nowrap;
+}
+
+.diff-pop__kinds {
+  color: rgba(255, 255, 255, 0.75);
+  text-align: right;
+}
+
+.diff-pop__empty {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.5);
 }
 
 .preview-modal {
