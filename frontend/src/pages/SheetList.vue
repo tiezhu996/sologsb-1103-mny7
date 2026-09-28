@@ -17,9 +17,12 @@ import BlankHint from '@/components/common/BlankHint.vue'
 import { useCueStore } from '@/stores/cueStore'
 import { useSessionStore } from '@/stores/sessionStore'
 import { useSheetStore } from '@/stores/sheetStore'
-import type { RehearsalSheet } from '@/types/sheet'
+import { useLevelStore } from '@/stores/levelStore'
+import { useFixtureStore } from '@/stores/fixtureStore'
+import type { RehearsalSheet, SheetDiff, SheetDiffKind } from '@/types/sheet'
 import { buildSheetText, cueTotalSeconds, formatDateTime, formatSeconds } from '@/utils/fade'
 import { buildSheetFilename, copyText, downloadTextFile } from '@/utils/export'
+import { diffSheet, SHEET_DIFF_KIND_LABELS } from '@/utils/sheetDiff'
 
 const router = useRouter()
 const message = useMessage()
@@ -27,6 +30,8 @@ const dialog = useDialog()
 const sessionStore = useSessionStore()
 const cueStore = useCueStore()
 const sheetStore = useSheetStore()
+const levelStore = useLevelStore()
+const fixtureStore = useFixtureStore()
 
 const showAllSessions = ref(false)
 const note = ref('')
@@ -108,6 +113,60 @@ function totalOf(sheet: RehearsalSheet): string {
     0
   )
   return formatSeconds(total)
+}
+
+/** 当前列出的每张排演表的落后差异（按 id 缓存，随 store 状态自动重算） */
+const diffMap = computed<Record<string, SheetDiff>>(() => {
+  const map: Record<string, SheetDiff> = {}
+  sheets.value.forEach((sheet) => {
+    map[sheet.id] = diffSheet(sheet, {
+      cues: cueStore.cuesOfSession(sheet.sessionId),
+      levels: levelStore.levels,
+      fixtures: fixtureStore.fixturesOfSession(sheet.sessionId)
+    })
+  })
+  return map
+})
+
+function diffOf(sheet: RehearsalSheet): SheetDiff {
+  return diffMap.value[sheet.id] ?? diffSheet(sheet, {
+    cues: cueStore.cuesOfSession(sheet.sessionId),
+    levels: levelStore.levels,
+    fixtures: fixtureStore.fixturesOfSession(sheet.sessionId)
+  })
+}
+
+/** 卡片上展示的各维度变化条目，例如 `顺序×2`、`过渡×1`（通道条数为亮度/色温字段数） */
+function diffBadges(sheet: RehearsalSheet): Array<{ kind: SheetDiffKind; label: string; count: number }> {
+  const diff = diffOf(sheet)
+  return (Object.keys(SHEET_DIFF_KIND_LABELS) as SheetDiffKind[])
+    .filter((kind) => diff.counts[kind] > 0)
+    .map((kind) => ({ kind, label: SHEET_DIFF_KIND_LABELS[kind], count: diff.counts[kind] }))
+}
+
+/** 卡片上展示的涉及编号（变化的当前编号 + 已删除编号） */
+function involvedCueNos(sheet: RehearsalSheet): string {
+  const diff = diffOf(sheet)
+  return [...diff.changedCueNos, ...diff.missingCueNos].join('、')
+}
+
+function handleSaveAsLatest(sheet: RehearsalSheet): void {
+  const diff = diffOf(sheet)
+  dialog.warning({
+    title: '按最新内容另存',
+    content: `将以当前现场的编号、顺序、过渡与通道亮度色温生成一张新排演表；${sheet.sheetNo} 原表保持不变。` +
+      (diff.missingCueNos.length > 0 ? `原表中 ${diff.missingCueNos.join('、')} 已不存在，不会收录到新表。` : ''),
+    positiveText: '另存为新表',
+    negativeText: '取消',
+    onPositiveClick: async () => {
+      const created = await sheetStore.saveAsLatest(sheet, `按最新内容另存自 ${sheet.sheetNo}`)
+      if (!created) {
+        message.error('另存失败：原表中的 Cue 已全部不存在')
+        return
+      }
+      message.success(`已另存为 ${created.sheetNo}，收录 ${created.cueLines.length} 条 Cue`)
+    }
+  })
 }
 
 async function handleCopy(sheet: RehearsalSheet): Promise<void> {
@@ -239,14 +298,34 @@ function goSessions(): void {
               <span class="sheet-card__no mono">{{ sheet.sheetNo }}</span>
               <span class="sheet-card__session">{{ sheetTitle(sheet) }}</span>
               <span class="toolbar__spacer" />
+              <NTag v-if="diffOf(sheet).stale" size="small" type="error" round :bordered="false">已落后</NTag>
               <span class="sheet-card__time mono">{{ formatDateTime(sheet.generatedAt) }}</span>
             </div>
 
             <p class="sheet-card__cues mono">{{ cueNoSummary(sheet) || '（空表）' }}</p>
 
+            <div v-if="diffOf(sheet).stale" class="sheet-card__diff">
+              <div class="sheet-card__diff-badges">
+                <NTag
+                  v-for="badge in diffBadges(sheet)"
+                  :key="badge.kind"
+                  size="small"
+                  type="warning"
+                  :bordered="false"
+                >
+                  {{ badge.label }} ×{{ badge.count }}
+                </NTag>
+                <NTag v-if="diffOf(sheet).missingCueNos.length > 0" size="small" type="error" :bordered="false">
+                  已删除 ×{{ diffOf(sheet).missingCueNos.length }}
+                </NTag>
+              </div>
+              <p class="sheet-card__diff-cues mono">涉及编号：{{ involvedCueNos(sheet) }}</p>
+            </div>
+
             <div class="sheet-card__meta">
               <span>Cue {{ sheet.cueLines.length }} 条</span>
               <span>过渡合计 {{ totalOf(sheet) }}</span>
+              <span v-if="sheet.derivedFromSheetId" class="muted">另存表</span>
               <span v-if="sheet.note">备注：{{ sheet.note }}</span>
             </div>
 
@@ -254,6 +333,15 @@ function goSessions(): void {
               <NButton size="tiny" @click="previewSheet = sheet">预览</NButton>
               <NButton size="tiny" quaternary @click="handleCopy(sheet)">复制文本</NButton>
               <NButton size="tiny" quaternary @click="handleDownload(sheet)">下载 .txt</NButton>
+              <NButton
+                v-if="diffOf(sheet).stale"
+                size="tiny"
+                type="warning"
+                secondary
+                @click="handleSaveAsLatest(sheet)"
+              >
+                按最新内容另存
+              </NButton>
               <NButton size="tiny" quaternary type="error" @click="confirmRemove(sheet)">删除</NButton>
             </div>
           </article>
@@ -268,12 +356,57 @@ function goSessions(): void {
       class="preview-modal"
       @update:show="(value) => { if (!value) previewSheet = null }"
     >
+      <NAlert
+        v-if="previewSheet && diffOf(previewSheet).stale"
+        type="warning"
+        :show-icon="true"
+        :bordered="false"
+        class="preview-diff"
+        title="本表生成后现场有新变化"
+      >
+        <div class="preview-diff__badges">
+          <NTag
+            v-for="badge in diffBadges(previewSheet)"
+            :key="badge.kind"
+            size="small"
+            type="warning"
+            :bordered="false"
+          >
+            {{ badge.label }} ×{{ badge.count }}
+          </NTag>
+          <NTag v-if="diffOf(previewSheet).missingCueNos.length > 0" size="small" type="error" :bordered="false">
+            已删除 ×{{ diffOf(previewSheet).missingCueNos.length }}
+          </NTag>
+        </div>
+        <ul class="preview-diff__list mono">
+          <li v-for="change in diffOf(previewSheet).changes" :key="change.cueId">
+            <span class="accent">{{ change.previousCueNo ? `${change.previousCueNo} → ${change.cueNo}` : change.cueNo }}</span>
+            <span class="muted">（{{ change.kinds.map((kind) => SHEET_DIFF_KIND_LABELS[kind]).join('、') }}）</span>
+            <span v-if="change.channelChanges.length > 0" class="preview-diff__ch">
+              <span v-for="(cc, idx) in change.channelChanges" :key="idx">
+                CH{{ cc.channel }} {{ cc.field === 'intensity' ? '亮度' : '色温' }} {{ cc.from }}{{ cc.field === 'intensity' ? '%' : 'K' }} → {{ cc.to }}{{ cc.field === 'intensity' ? '%' : 'K' }}；
+              </span>
+            </span>
+          </li>
+          <li v-if="diffOf(previewSheet).missingCueNos.length > 0" class="preview-diff__missing">
+            已不再存在：{{ diffOf(previewSheet).missingCueNos.join('、') }}
+          </li>
+        </ul>
+      </NAlert>
       <pre class="preview-text">{{ previewText }}</pre>
       <template #footer>
         <div class="modal-footer">
           <NButton @click="previewSheet = null">关闭</NButton>
           <NButton v-if="previewSheet" quaternary @click="handleCopy(previewSheet)">复制文本</NButton>
           <NButton v-if="previewSheet" type="primary" @click="handleDownload(previewSheet)">下载 .txt</NButton>
+          <NButton
+            v-if="previewSheet && diffOf(previewSheet).stale"
+            type="warning"
+            secondary
+            @click="handleSaveAsLatest(previewSheet)"
+          >
+            按最新内容另存
+          </NButton>
         </div>
       </template>
     </NModal>
@@ -410,6 +543,30 @@ function goSessions(): void {
   word-break: break-all;
 }
 
+.sheet-card__diff {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(242, 181, 68, 0.07);
+  border: 1px solid rgba(242, 181, 68, 0.22);
+}
+
+.sheet-card__diff-badges {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.sheet-card__diff-cues {
+  margin: 0;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.7);
+  line-height: 1.6;
+  word-break: break-all;
+}
+
 .sheet-card__meta {
   display: flex;
   gap: 14px;
@@ -429,6 +586,35 @@ function goSessions(): void {
 .preview-modal {
   width: 720px;
   max-width: 94vw;
+}
+
+.preview-diff {
+  margin-bottom: 12px;
+}
+
+.preview-diff__badges {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.preview-diff__list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 1.9;
+  color: rgba(255, 255, 255, 0.78);
+}
+
+.preview-diff__ch {
+  display: block;
+  padding-left: 12px;
+  color: rgba(255, 255, 255, 0.6);
+}
+
+.preview-diff__missing {
+  color: #ff7878;
 }
 
 .preview-text {

@@ -8,7 +8,7 @@ import type { Session } from '@/types/session'
 /** IndexedDB 数据库名 */
 export const DB_NAME = 'gbcuesheet'
 /** 当前数据结构版本号，与 db.version() 对应 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 单键值元数据表，记录结构版本等本地状态 */
 export interface AppMetaRecord {
@@ -22,6 +22,8 @@ export interface AppMetaRecord {
  * - v1：场次 / 灯位通道 / Cue / 通道电平 / 排演表 五张表
  * - v2：场次补充 updatedAt 索引、排演表补充 sheetNo 索引与条目快照、新增 appMeta 元数据表，
  *       并对既有数据执行升级迁移（补齐字段、规范化遗留编号）
+ * - v3：排演表快照补充生成时位次 seq、表级补充 missingCueNos / derivedFromSheetId，
+ *       支撑历史排演表落后检测与「按最新内容另存」（无索引变化）
  */
 export class CueSheetDatabase extends Dexie {
   sessions!: Table<Session, string>
@@ -76,6 +78,23 @@ export class CueSheetDatabase extends Dexie {
             if (!Array.isArray(sheet.includedCueIds)) sheet.includedCueIds = []
           })
       })
+
+    // v3：排演表条目快照补充生成时位次 seq，表级补充已删除编号与来源表字段，
+    // 用于历史排演表落后检测与「按最新内容另存」。无索引变化，仅做数据迁移。
+    this.version(3).upgrade(async (transaction) => {
+      await transaction
+        .table('sheets')
+        .toCollection()
+        .modify((sheet: RehearsalSheet) => {
+          if (Array.isArray(sheet.cueLines)) {
+            sheet.cueLines.forEach((line, index) => {
+              if (typeof line.seq !== 'number') line.seq = index + 1
+            })
+          }
+          if (!Array.isArray(sheet.missingCueNos)) sheet.missingCueNos = []
+          if (sheet.derivedFromSheetId === undefined) sheet.derivedFromSheetId = null
+        })
+    })
   }
 }
 

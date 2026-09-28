@@ -42,7 +42,7 @@ docker compose up -d --build    # 改动代码后重新构建
 | `/sessions/:id/fixtures` | 灯位通道配置台 | 通道号排布、按灯位分组折叠、重复通道号高亮、灯位负载校验 | Fixture、Session |
 | `/sessions/:id/cues` | Cue 编排时间轴 | 插入 / 复制 / 删除 Cue、拖拽调整先后、沿袭上一条参数、批量偏移过渡时间 | Cue、CueLevel |
 | `/cues/:id/levels` | 通道电平编辑 | 逐通道设定亮度与色温、色温漂移检查、一键对齐基准色温 | CueLevel、Fixture |
-| `/sheets` | 排演表生成与导出 | 勾选 Cue 组表、本地留存历史、预览 / 复制 / 下载纯文本 | RehearsalSheet、Cue |
+| `/sheets` | 排演表生成与导出 | 勾选 Cue 组表、本地留存历史、预览 / 复制 / 下载纯文本；历史表对照现场检测编号 / 顺序 / 过渡 / 通道亮度色温变化、按最新内容另存 | RehearsalSheet、Cue |
 
 核心动作闭环：**建场次 → 配灯位通道 → 插入 Cue → 设定过渡与通道电平 → 导出排演表**。
 
@@ -93,21 +93,22 @@ sologsb-1103/
         │   ├── LevelEditor.vue  SheetList.vue
         ├── router/index.ts
         └── utils/
-            ├── fade.ts     # 过渡时间格式化、色温一致性判定、排演表纯文本拼装
-            ├── db.ts       # IndexedDB（Dexie）封装：版本号与升级迁移
-            ├── export.ts   # 文本下载、文件名生成、剪贴板复制
-            ├── cueOrder.ts # Cue 编号解析、比较、排序与位次计算
-            ├── patch.ts    # 通道冲突 / 灯位负载纯函数
-            └── id.ts       # 本地主键生成
+            ├── fade.ts      # 过渡时间格式化、色温一致性判定、排演表纯文本拼装
+            ├── db.ts        # IndexedDB（Dexie）封装：版本号与升级迁移
+            ├── export.ts    # 文本下载、文件名生成、剪贴板复制
+            ├── cueOrder.ts  # Cue 编号解析、比较、排序与位次计算
+            ├── sheetDiff.ts # 历史排演表快照对照现场：编号/顺序/过渡/通道亮度色温差异
+            ├── patch.ts     # 通道冲突 / 灯位负载纯函数
+            └── id.ts        # 本地主键生成
 ```
 
 ## 六、数据存储说明
 
 - 所有数据存放在**浏览器本地 IndexedDB**，数据库名 `gbcuesheet`，由 `src/utils/db.ts` 用 Dexie 统一封装；页面不直接读写数据库，只调用 store 的 action。
 - 共 6 张表：`sessions`、`fixtures`、`cues`、`levels`、`sheets`、`appMeta`（元数据）。
-- **数据结构版本号**：`DB_VERSION = 2`。`version(1)` 定义初始结构；`version(2)` 新增 `updatedAt` / `sheetNo` 索引、`appMeta` 表，并在 `upgrade()` 中迁移既有数据（补齐 `updatedAt`、`orderIndex`、`holdSec`，规范化遗留排演表编号与条目快照）。
+- **数据结构版本号**：`DB_VERSION = 3`。`version(1)` 定义初始结构；`version(2)` 新增 `updatedAt` / `sheetNo` 索引、`appMeta` 表，并在 `upgrade()` 中迁移既有数据（补齐 `updatedAt`、`orderIndex`、`holdSec`，规范化遗留排演表编号与条目快照）；`version(3)` 给排演表快照补生成时位次 `seq`、给表补 `missingCueNos` / `derivedFromSheetId`（无索引变化），支撑历史表落后检测与「按最新内容另存」。
 - 删除场次会级联清理其灯位通道、Cue、通道电平与排演表；删除通道会清理对应的电平记录。
-- **容器无状态**：不使用数据库服务、不挂载命名卷；换浏览器或清理站点数据即等于清空。排演表以生成时刻的快照留档，之后修改 Cue 不影响历史记录。
+- **容器无状态**：不使用数据库服务、不挂载命名卷；换浏览器或清理站点数据即等于清空。排演表以生成时刻的快照留档，之后修改 Cue 不影响历史记录；历史列表会实时对照当前现场数据标出落后项（变化条数与涉及编号），点「按最新内容另存」时原表保持生成时内容，新表只收录原表中仍存在的 Cue，并单列已不再存在的编号。
 
 ## 七、容器化实现要点
 

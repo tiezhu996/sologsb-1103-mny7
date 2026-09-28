@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
+import type { Cue } from '@/types/cue'
 import type { RehearsalSheet, SheetChannelLine, SheetCueLine, SheetDraft } from '@/types/sheet'
 import { db } from '@/utils/db'
 import { createId } from '@/utils/id'
@@ -51,17 +52,14 @@ export const useSheetStore = defineStore('sheet', () => {
     hydrated.value = true
   }
 
-  /** 依据勾选的 Cue 组装条目快照并落库 */
-  async function createSheet(draft: SheetDraft): Promise<RehearsalSheet | null> {
-    const cueStore = useCueStore()
+  /** 依据给定 Cue（已按时间轴排序）组装生成时刻的条目快照 */
+  function buildCueLines(sessionId: string, orderedCues: readonly Cue[]): SheetCueLine[] {
     const levelStore = useLevelStore()
     const fixtureStore = useFixtureStore()
+    const sessionFixtures = sortFixturesByChannel(fixtureStore.fixturesOfSession(sessionId))
 
-    const ordered = cueStore.sortedCuesOfSession(draft.sessionId).filter((cue) => draft.cueIds.includes(cue.id))
-    if (ordered.length === 0) return null
-
-    const cueLines: SheetCueLine[] = ordered.map((cue) => {
-      const channels: SheetChannelLine[] = sortFixturesByChannel(fixtureStore.fixturesOfSession(draft.sessionId))
+    return orderedCues.map((cue, index) => {
+      const channels: SheetChannelLine[] = sessionFixtures
         .map((fixture) => {
           const level = levelStore.levelOf(cue.id, fixture.id)
           if (!level) return null
@@ -79,6 +77,7 @@ export const useSheetStore = defineStore('sheet', () => {
 
       return {
         cueId: cue.id,
+        seq: index + 1,
         cueNo: cue.cueNo,
         label: cue.label,
         trigger: cue.trigger,
@@ -89,6 +88,16 @@ export const useSheetStore = defineStore('sheet', () => {
         channels
       }
     })
+  }
+
+  /** 依据勾选的 Cue 组装条目快照并落库 */
+  async function createSheet(draft: SheetDraft): Promise<RehearsalSheet | null> {
+    const cueStore = useCueStore()
+
+    const ordered = cueStore.sortedCuesOfSession(draft.sessionId).filter((cue) => draft.cueIds.includes(cue.id))
+    if (ordered.length === 0) return null
+
+    const cueLines = buildCueLines(draft.sessionId, ordered)
 
     const generatedAt = new Date()
     const created: RehearsalSheet = {
@@ -98,7 +107,44 @@ export const useSheetStore = defineStore('sheet', () => {
       generatedAt: generatedAt.toISOString(),
       includedCueIds: cueLines.map((line) => line.cueId),
       note: draft.note,
-      cueLines
+      cueLines,
+      missingCueNos: [],
+      derivedFromSheetId: null
+    }
+    await db.sheets.put(created)
+    sheets.value = [...sheets.value, created]
+    return created
+  }
+
+  /**
+   * 按最新内容另存：原表保持生成时内容不变；新表只收录原表中仍存在的 Cue，
+   * 并用当前的编号 / 顺序 / 过渡 / 通道亮度色温重建快照；已删除的编号单列。
+   * 若原表 Cue 已全部不存在，返回 null。
+   */
+  async function saveAsLatest(source: RehearsalSheet, note: string): Promise<RehearsalSheet | null> {
+    const cueStore = useCueStore()
+
+    const survivingIds = new Set(source.cueLines.map((line) => line.cueId))
+    const ordered = cueStore.sortedCuesOfSession(source.sessionId).filter((cue) => survivingIds.has(cue.id))
+    if (ordered.length === 0) return null
+
+    const missingNos = source.cueLines
+      .filter((line) => !ordered.some((cue) => cue.id === line.cueId))
+      .map((line) => line.cueNo)
+
+    const cueLines = buildCueLines(source.sessionId, ordered)
+
+    const generatedAt = new Date()
+    const created: RehearsalSheet = {
+      id: createId('sheet'),
+      sessionId: source.sessionId,
+      sheetNo: buildSheetNo(nextSequence(generatedAt), generatedAt),
+      generatedAt: generatedAt.toISOString(),
+      includedCueIds: cueLines.map((line) => line.cueId),
+      note,
+      cueLines,
+      missingCueNos: missingNos,
+      derivedFromSheetId: source.id
     }
     await db.sheets.put(created)
     sheets.value = [...sheets.value, created]
@@ -127,6 +173,7 @@ export const useSheetStore = defineStore('sheet', () => {
     sheetById,
     hydrate,
     createSheet,
+    saveAsLatest,
     removeSheet,
     removeBySession
   }

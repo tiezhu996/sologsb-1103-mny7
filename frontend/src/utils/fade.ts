@@ -176,6 +176,9 @@ export function buildSheetText(sheet: RehearsalSheet, session?: Session): string
   }
   lines.push(`生成时间：${formatDateTime(sheet.generatedAt)}`)
   lines.push(`Cue 数量：${sheet.cueLines.length}`)
+  if (sheet.missingCueNos.length > 0) {
+    lines.push(`原表已不存在、未收录的 Cue：${sheet.missingCueNos.join('、')}`)
+  }
   if (sheet.note) lines.push(`制表备注：${sheet.note}`)
   lines.push('')
 
